@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 from typing import Optional
@@ -692,6 +693,64 @@ async def test_close_only_closes_own_client():
   await plugin.close()
 
   built_client.transport.close.assert_awaited_once()
+
+
+# --- Event loops ------------------------------------------------------------
+
+
+def _patched_client_class(built: list[mock.Mock]):
+  """Patches the SDK client class to record each client the plugin builds."""
+
+  def build(**_):
+    client = _sdk_client()
+    client.transport.close = mock.AsyncMock()
+    built.append(client)
+    return client
+
+  return mock.patch.object(
+      modelarmor_v1, 'ModelArmorAsyncClient', side_effect=build
+  )
+
+
+def test_each_event_loop_gets_its_own_client():
+  """The sync ``Runner.run()`` serves every call on a new event loop.
+
+  A ``grpc.aio`` channel belongs to the loop it was opened on, so a client
+  built on a loop that has since closed must not be reused by the next one.
+  """
+  plugin = ModelArmorPlugin(config=_config())
+  built = []
+
+  async def screen_twice():
+    await _screen_input(plugin, _user_request('hello'))
+    await _screen_input(plugin, _user_request('hello again'))
+
+  with _patched_client_class(built):
+    asyncio.run(screen_twice())
+    asyncio.run(screen_twice())
+
+  assert len(built) == 2
+  assert [len(_screened(client)) for client in built] == [2, 2]
+
+
+def test_close_closes_only_the_client_of_the_running_loop():
+  """close() reaches the running loop's client and never builds one."""
+  plugin = ModelArmorPlugin(config=_config())
+  built = []
+
+  async def screen_then_close():
+    await _screen_input(plugin, _user_request('hello'))
+    await plugin.close()
+
+  with _patched_client_class(built):
+    asyncio.run(_screen_input(plugin, _user_request('hello')))
+    asyncio.run(screen_then_close())
+    asyncio.run(plugin.close())
+
+  assert len(built) == 2
+  stale_client, current_client = built
+  stale_client.transport.close.assert_not_awaited()
+  current_client.transport.close.assert_awaited_once()
 
 
 # --- Tool output screening --------------------------------------------------

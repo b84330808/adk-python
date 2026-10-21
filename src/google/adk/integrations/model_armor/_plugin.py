@@ -45,6 +45,8 @@ from ...plugins.base_plugin import BasePlugin
 from ...tools.base_tool import BaseTool
 from ...tools.tool_context import ToolContext
 from ...utils import _mtls_utils
+from ...utils._event_loop_cache import peek_per_loop_value
+from ...utils._event_loop_cache import per_loop_value
 from ._config import ModelArmorConfig
 
 try:
@@ -63,6 +65,9 @@ except ImportError as e:
 logger = logging.getLogger('google_adk.' + __name__)
 
 USER_AGENT = f'adk-model-armor-plugin google-adk/{version.__version__}'
+
+# The ``__dict__`` entry holding the plugin's per-event-loop clients.
+_CLIENT_CACHE_KEY = '_client_per_loop'
 
 # Model Armor skips filters past 65,536 tokens (~1 token/char worst case).
 _MAX_TOOL_OUTPUT_CHARS = 65_536
@@ -94,7 +99,6 @@ class ModelArmorPlugin(BasePlugin):
     self._config = config
 
     self._supplied_client = client
-    self._client: Optional[modelarmor_v1.ModelArmorAsyncClient] = None
     self._credentials = credentials
 
     self._location = _shared_template_location(
@@ -167,23 +171,25 @@ class ModelArmorPlugin(BasePlugin):
 
   @property
   def client(self) -> modelarmor_v1.ModelArmorAsyncClient:
-    """Returns the underlying async client, constructing it lazily.
+    """Returns the async client for the running event loop.
 
     A ``grpc.aio`` channel binds to the event loop running when it is created.
-    Plugins are usually built at import time with no loop, so the channel has
-    to be created on first use to land on the loop that serves requests.
+    Plugins are usually built at import time with no loop, and the synchronous
+    ``Runner.run()`` serves each call on a new loop, so the plugin builds one
+    client per loop on first use instead of one for its whole lifetime.
     """
     if self._supplied_client:
       return self._supplied_client
-    if self._client is None:
-      self._client = modelarmor_v1.ModelArmorAsyncClient(
-          credentials=self._credentials,
-          client_info=ClientInfo(user_agent=USER_AGENT),
-          client_options=ClientOptions(
-              api_endpoint=_regional_endpoint(self._location)
-          ),
-      )
-    return self._client
+    return per_loop_value(self, _CLIENT_CACHE_KEY, self._build_client)
+
+  def _build_client(self) -> modelarmor_v1.ModelArmorAsyncClient:
+    return modelarmor_v1.ModelArmorAsyncClient(
+        credentials=self._credentials,
+        client_info=ClientInfo(user_agent=USER_AGENT),
+        client_options=ClientOptions(
+            api_endpoint=_regional_endpoint(self._location)
+        ),
+    )
 
   async def _sanitize_user_prompt(
       self, text: str, template_name: str
@@ -248,9 +254,14 @@ class ModelArmorPlugin(BasePlugin):
     return None
 
   async def close(self) -> None:
-    """Closes the underlying client."""
-    if self._client:
-      await self._client.transport.close()
+    """Closes the client built for the running event loop, if any.
+
+    A client built for a loop that has since closed can no longer be closed;
+    its channel is released when the client is garbage collected.
+    """
+    client = peek_per_loop_value(self, _CLIENT_CACHE_KEY)
+    if client:
+      await client.transport.close()
 
   def _handle_sanitization_result(
       self,

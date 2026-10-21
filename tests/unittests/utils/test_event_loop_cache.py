@@ -24,6 +24,7 @@ import time
 import warnings
 import weakref
 
+from google.adk.utils._event_loop_cache import peek_per_loop_value
 from google.adk.utils._event_loop_cache import PerLoopCachedProperty
 import pytest
 
@@ -219,6 +220,22 @@ def test_a_cached_value_of_none_is_not_rebuilt():
     return owner.value, owner.value
 
   assert asyncio.run(read_twice()) == (None, None)
+  assert len(owner.builds) == 1
+
+
+def test_peek_returns_the_running_loop_value_without_building_one():
+  owner = _Owner()
+
+  async def peek():
+    return peek_per_loop_value(owner, '_per_loop_value')
+
+  async def read_then_peek():
+    return owner.value, await peek()
+
+  assert asyncio.run(peek()) is None
+  value, peeked = asyncio.run(read_then_peek())
+  assert peeked is value
+  assert asyncio.run(peek()) is None
   assert len(owner.builds) == 1
 
 

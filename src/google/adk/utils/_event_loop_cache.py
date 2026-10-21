@@ -23,6 +23,7 @@ import threading
 from typing import Any
 from typing import cast
 from typing import Generic
+from typing import Optional
 from typing import TYPE_CHECKING
 from typing import TypeVar
 import weakref
@@ -40,6 +41,14 @@ class _NoRunningLoop:
 
 
 _NO_RUNNING_LOOP = _NoRunningLoop()
+
+
+def _running_loop_key() -> Any:
+  """Returns the running loop, or the shared key for reads outside a loop."""
+  try:
+    return asyncio.get_running_loop()
+  except RuntimeError:
+    return _NO_RUNNING_LOOP
 
 
 class _PerLoopCache(Generic[_T]):
@@ -90,12 +99,13 @@ class _PerLoopCache(Generic[_T]):
     """
     return (_PerLoopCache, ())
 
+  def peek(self) -> Optional[_T]:
+    """Returns the value for the running loop, or ``None`` if none was built."""
+    return self._values.get(_running_loop_key())
+
   def get(self, build: Callable[[], _T]) -> _T:
     """Returns the value for the running loop, calling ``build`` on a miss."""
-    try:
-      loop: Any = asyncio.get_running_loop()
-    except RuntimeError:
-      loop = _NO_RUNNING_LOOP
+    loop = _running_loop_key()
 
     # Membership rather than a default, so a cached value of None is a hit.
     # The key is held by `loop` for as long as this call runs, so the entry
@@ -171,6 +181,20 @@ def per_loop_value(owner: Any, key: str, build: Callable[[], _T]) -> _T:
   """
   cache: _PerLoopCache[_T] = _cache_for(owner, key)
   return cache.get(build)
+
+
+def peek_per_loop_value(owner: Any, key: str) -> Any:
+  """Returns ``owner``'s value for the running event loop without building it.
+
+  Args:
+    owner: The object the value belongs to.
+    key: The ``owner.__dict__`` entry passed to ``per_loop_value``.
+
+  Returns:
+    The value built for the running event loop, or ``None`` if there is none.
+  """
+  cache = owner.__dict__.get(key)
+  return None if cache is None else cache.peek()
 
 
 if TYPE_CHECKING:
